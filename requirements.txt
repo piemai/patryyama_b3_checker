@@ -5,3 +5,4 @@ requests
 faker
 urllib3
 jinja2
+python-multipart
