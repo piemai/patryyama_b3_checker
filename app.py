@@ -1,9 +1,10 @@
-# app.py
+# partyrama_gate.py
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import logging
 import random
 import re
 import uuid
@@ -226,7 +227,7 @@ async def check_cards(request: Request, cards: str = Form(...), proxies: str = F
     pool = ProxyPool(proxy_list)
 
     results = []
-    for card in card_list[:10]: # Limit muna para sa web request performance
+    for card in card_list[:10]:
         res = run_single_card(card, pool)
         results.append(res)
 
