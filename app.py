@@ -18,7 +18,7 @@ from faker import Faker
 
 urllib3.disable_warnings()
 
-app = FastAPI(title="Partyrama Braintree Checker")
+app = FastAPI(title="Ollie Partyrama Braintree Checker")
 
 templates_dir = Path("templates")
 templates_dir.mkdir(exist_ok=True)
@@ -217,7 +217,7 @@ def run_single_card(card_line, pool):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "results": None})
+    return templates.TemplateResponse(request, "index.html", {"results": None})
 
 @app.post("/check", response_class=HTMLResponse)
 async def check_cards(request: Request, cards: str = Form(...), proxies: str = Form("")):
@@ -230,4 +230,4 @@ async def check_cards(request: Request, cards: str = Form(...), proxies: str = F
         res = run_single_card(card, pool)
         results.append(res)
 
-    return templates.TemplateResponse("index.html", {"request": request, "results": results})
+    return templates.TemplateResponse(request, "index.html", {"results": results})
