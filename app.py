@@ -18,7 +18,7 @@ from faker import Faker
 
 urllib3.disable_warnings()
 
-app = FastAPI(title="Ollie Partyrama Braintree Checker")
+app = FastAPI(title="Partyrama Braintree Checker")
 
 templates_dir = Path("templates")
 templates_dir.mkdir(exist_ok=True)
