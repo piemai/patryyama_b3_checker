@@ -4,3 +4,4 @@ curl-cffi
 requests
 faker
 urllib3
+jinja2
